@@ -1,11 +1,16 @@
-use std::thread::{self, JoinHandle};
 use std::sync::{mpsc, Arc, Mutex};
+use std::thread::{self, JoinHandle};
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
+enum Message {
+    NewJob(Job),
+    Terminate,
+}
+
 pub struct ThreadPool {
     workers: Vec<Worker>,
-    sender: mpsc::Sender<Job>,
+    sender: mpsc::Sender<Message>,
 }
 
 impl ThreadPool {
@@ -13,11 +18,11 @@ impl ThreadPool {
         assert!(size > 0);
         let (sender, reciever) = mpsc::channel();
 
-        let reciever =Arc::new(Mutex::new(reciever));
+        let reciever = Arc::new(Mutex::new(reciever));
 
         let mut workers = Vec::with_capacity(size);
         for i in 0..size {
-            workers.push(Worker::new(i,Arc::clone(&reciever)));
+            workers.push(Worker::new(i, Arc::clone(&reciever)));
         }
         ThreadPool { workers, sender }
     }
@@ -27,21 +32,45 @@ impl ThreadPool {
         F: FnOnce() + Send + 'static,
     {
         let job = Box::new(f);
-        self.sender.send(job).unwrap();
+        self.sender.send(Message::NewJob(job)).unwrap();
     }
 }
 
-struct Worker{
-    id: usize,
-    thread: thread::JoinHandle<()>
+impl Drop for ThreadPool {
+    fn drop(&mut self) {
+
+        for _ in &self.workers{
+            self.sender.send(Message::Terminate).unwrap();
+        }
+        for w in &mut self.workers {
+            if let Some(thread) = w.thread.take() {
+                thread.join().unwrap();
+            }
+        }
+    }
 }
 
-impl Worker{
-    fn new(id:usize, reciever: Arc<Mutex<mpsc::Receiver<Job>>>)-> Worker{
+struct Worker {
+    id: usize,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl Worker {
+    fn new(id: usize, reciever: Arc<Mutex<mpsc::Receiver<Message>>>) -> Worker {
         let thread = thread::spawn(move || loop {
-            let job = reciever.lock().unwrap().recv().unwrap();
-            job();
+            let message = reciever.lock().unwrap().recv().unwrap();
+            match message {
+                Message::NewJob(job) => {
+                    job();
+                }
+                Message::Terminate => {
+                    break;
+                }
+            }
         });
-        Worker {id, thread}
+        Worker {
+            id,
+            thread: Some(thread),
+        }
     }
 }
